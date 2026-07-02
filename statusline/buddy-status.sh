@@ -114,9 +114,17 @@ RAINBOW_LEN=${#RAINBOW[@]}
 RAINBOW_OFFSET=$(( NOW % RAINBOW_LEN ))
 
 # ─── Terminal width ──────────────────────────────────────────────────────────
-COLS=0
+# Claude Code >= 2.1.153 sets COLUMNS/LINES to the real terminal size before
+# running the status line command — it captures our stdout instead of piping
+# it to the terminal, so tput/stty/PID-walk detection below can't see the
+# real size and may silently return a stale/wrong value from an unrelated fd.
+# Trust COLUMNS first; only fall back to guessing if it's absent.
+COLS=${COLUMNS:-0}
+case "$COLS" in ''|*[!0-9]*) COLS=0 ;; esac
+
 PID=$$
 for _ in 1 2 3 4 5; do
+    [ "${COLS:-0}" -gt 40 ] 2>/dev/null && break
     PID=$(ps -o ppid= -p "$PID" 2>/dev/null | tr -d ' ')
     [ -z "$PID" ] || [ "$PID" = "1" ] && break
 
@@ -279,7 +287,14 @@ if [ -n "$BUBBLE_TEXT" ]; then
     CUR_LINE=""
     CUR_W=0
     for word in "${WORDS[@]}"; do
-        word_w=$(dwidth "$word")
+        # Fast path: pure ASCII needs no iconv/od/awk subprocess spawn —
+        # char count equals display width. Only non-ASCII words (emoji/CJK)
+        # pay for the full dwidth() pipeline. This matters a lot on Windows,
+        # where each subprocess spawn costs ~100ms+.
+        case "$word" in
+            *[![:ascii:]]*) word_w=$(dwidth "$word") ;;
+            *) word_w=${#word} ;;
+        esac
         if [ -z "$CUR_LINE" ]; then
             CUR_LINE="$word"; CUR_W=$word_w
         elif [ $(( CUR_W + 1 + word_w )) -le $INNER_W ]; then
