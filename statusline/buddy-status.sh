@@ -309,6 +309,18 @@ fi
 
 TEXT_COUNT=${#TEXT_LINES[@]}
 
+# Pad with blank text rows so the box (border+text+border) is at least as
+# tall as the buddy's visible art (species frames are 5 lines: 1 blank top
+# + 4 body lines) — otherwise a 1-line reaction produces a 3-line box that
+# only covers half the character, leaving feet dangling without a box.
+MIN_BUBBLE_H=4
+if [ $TEXT_COUNT -gt 0 ]; then
+    while [ $(( TEXT_COUNT + 2 )) -lt $MIN_BUBBLE_H ]; do
+        TEXT_LINES+=("")
+        TEXT_COUNT=$(( TEXT_COUNT + 1 ))
+    done
+fi
+
 # Build box as plain strings (no ANSI). Color applied at output time.
 # Box display width = INNER_W + 4:  "| " + text(INNER_W) + " |"
 BOX_W=$(( INNER_W + 4 ))
@@ -345,10 +357,20 @@ PAD=$(( COLS - TOTAL_W - MARGIN ))
 [ "$PAD" -lt 0 ] && PAD=0
 
 # On Windows (Git Bash / MSYS2), Braille Blank (U+2800) renders as double-width,
-# which doubles the spacer and pushes content off-screen. Use regular spaces instead.
+# so filling the whole pad with it blows the spacer up and pushes content
+# off-screen. But plain spaces alone get stripped by Claude Code's leading-
+# whitespace trim, which is why the card was landing left-aligned. Fix: one
+# Braille Blank as a non-whitespace anchor at column 0 (trim stops there),
+# regular single-width spaces for the rest of the pad.
 case "$(uname -s)" in
-    MINGW*|CYGWIN*|MSYS*) SPACER=$(printf '%*s' "$PAD" '') ;;
-    *)                     SPACER=$(printf "${B}%${PAD}s" "") ;;
+    MINGW*|CYGWIN*|MSYS*)
+        if [ "$PAD" -ge 2 ]; then
+            SPACER="${B}$(printf '%*s' "$(( PAD - 2 ))" '')"
+        else
+            SPACER=$(printf '%*s' "$PAD" '')
+        fi
+        ;;
+    *) SPACER=$(printf "${B}%${PAD}s" "") ;;
 esac
 GAP_STR=$(printf '%*s' "$GAP" '')
 
