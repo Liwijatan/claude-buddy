@@ -4,7 +4,7 @@
 # Art rendering: the server (writeStatusState in server/state.ts) pre-bakes
 # every frame with eye, hat overlay, and blink resolved, and writes them into
 # status.json along with the frame-index sequence. This script is a dumb
-# cycler — one jq call per tick picks the current frame body.
+# cycler — the single state jq call per tick also picks the current frame body.
 #
 # BUDDY_FAKE_NOW env var: override wall clock for snapshot tests.
 #
@@ -14,8 +14,12 @@
 # so the buddy doesn't show up twice (once in status line, once in wrapper panel).
 [ "$BUDDY_SHELL" = "1" ] && exit 0
 
+# Avoid a dirname subprocess spawn (~100ms on Windows): strip the last path
+# component in-shell. A slash-free invocation means "current directory".
+_SELF_DIR="${BASH_SOURCE[0]%/*}"
+[ "$_SELF_DIR" = "${BASH_SOURCE[0]}" ] && _SELF_DIR=.
 # shellcheck source=../scripts/paths.sh
-source "$(dirname "${BASH_SOURCE[0]}")/../scripts/paths.sh"
+source "$_SELF_DIR/../scripts/paths.sh"
 
 STATE="$BUDDY_STATE_DIR/status.json"
 CONFIG_FILE="$BUDDY_STATE_DIR/config.json"
@@ -25,27 +29,67 @@ SID="${SID:-default}"
 
 [ -f "$STATE" ] || exit 0
 
-MUTED=$(jq -r '.muted // false' "$STATE" 2>/dev/null)
+# One jq call reads every scalar field AND the current animation frame:
+# the first output line is a @tsv record, the remaining lines are the frame
+# body. On Windows each jq spawn costs ~200ms, so the previous nine separate
+# calls dominated total runtime (same pattern as the usage-fallback block).
+if [ -n "${BUDDY_FAKE_NOW:-}" ]; then
+    NOW=$BUDDY_FAKE_NOW
+else
+    # printf %(%s)T is a bash builtin (>= 4.2) — no `date` subprocess spawn.
+    # macOS ships bash 3.2 without it; fall back to date there.
+    printf -v NOW '%(%s)T' -1 2>/dev/null || NOW=$(date +%s)
+fi
+# @tsv escapes tab/newline/backslash inside fields, keeping the record on one
+# line. Every field gets an "x" sentinel prefix so no field is ever empty —
+# tab is IFS whitespace, so bash `read` would collapse runs of tabs from
+# empty fields and silently shift all following fields into the wrong
+# variables. The sentinel is stripped right after the read.
+STATE_OUT=$(jq -r --argjson now "$NOW" '
+    ([
+      (.muted // false),
+      (.name // ""),
+      (.rarity // "common"),
+      (.shiny // false),
+      (.reaction // ""),
+      (.achievement // ""),
+      (.level // 1),
+      (.mood // "focused")
+    ] | map("x" + tostring) | @tsv),
+    ((.frameSequence // []) as $fs
+     | if ($fs | length) > 0
+       then (.frames[$fs[$now % ($fs | length)]] // "")
+       else "" end)
+' "$STATE" 2>/dev/null)
+
+STATE_REC="${STATE_OUT%%$'\n'*}"
+IFS=$'\t' read -r MUTED NAME RARITY SHINY REACTION ACHIEVEMENT LEVEL MOOD <<< "$STATE_REC"
+MUTED=${MUTED#x}
+NAME=${NAME#x}
+RARITY=${RARITY#x}
+SHINY=${SHINY#x}
+REACTION=${REACTION#x}
+ACHIEVEMENT=${ACHIEVEMENT#x}
+LEVEL=${LEVEL#x}
+MOOD=${MOOD#x}
+# printf %b undoes the @tsv escaping (\t, \n, \\), restoring exactly what the
+# old per-field `jq -r` calls produced for the free-text string fields.
+printf -v NAME '%b' "$NAME"
+printf -v REACTION '%b' "$REACTION"
+printf -v ACHIEVEMENT '%b' "$ACHIEVEMENT"
+
 [ "$MUTED" = "true" ] && exit 0
-
-NAME=$(jq -r '.name // ""' "$STATE" 2>/dev/null)
 [ -z "$NAME" ] && exit 0
-
-RARITY=$(jq -r '.rarity // "common"' "$STATE" 2>/dev/null)
-SHINY=$(jq -r '.shiny // false' "$STATE" 2>/dev/null)
-REACTION=$(jq -r '.reaction // ""' "$STATE" 2>/dev/null)
-ACHIEVEMENT=$(jq -r '.achievement // ""' "$STATE" 2>/dev/null)
-LEVEL=$(jq -r '.level // 1' "$STATE" 2>/dev/null)
-MOOD=$(jq -r '.mood // "focused"' "$STATE" 2>/dev/null)
 
 STDIN_DATA=$(cat)
 
 # ─── Animation: pick current frame from server-rendered frames ──────────────
-NOW=${BUDDY_FAKE_NOW:-$(date +%s)}
-FRAME_BODY=$(jq -r --argjson now "$NOW" '
-    .frameSequence[$now % (.frameSequence | length)] as $idx
-    | .frames[$idx] // ""
-' "$STATE" 2>/dev/null)
+# Everything after the first line of STATE_OUT is the frame body (multi-line).
+if [ "$STATE_OUT" = "$STATE_REC" ]; then
+    FRAME_BODY=""
+else
+    FRAME_BODY="${STATE_OUT#*$'\n'}"
+fi
 
 # Fallback when status.json lacks .frames — e.g. server/bash version skew
 # during install or while the MCP server hasn't rewritten the file yet. Keep
@@ -59,12 +103,33 @@ while IFS= read -r line; do
     ART_LINES+=("$line")
 done <<< "$FRAME_BODY"
 
-# ─── Rarity color (theme-aware) ─────────────────────────────────────────────
+# ─── Config (single jq call: theme, TTL, bubble geometry, rainbow) ──────────
+# Same consolidation as the state read above: one @tsv record instead of five
+# separate jq spawns. rainbowColors is an array → joined with spaces here and
+# word-split at use site (identical to the old `@tsv` + unquoted-$_custom).
 _THEME="dark"
+_CFG_TTL=""
+_CFG_BW=""
+_CFG_BM=""
+_custom=""
 if [ -f "$CONFIG_FILE" ]; then
-    _cfg_theme=$(jq -r '.theme // "auto"' "$CONFIG_FILE" 2>/dev/null)
+    CFG_TSV=$(jq -r '[
+        (.theme // "auto"),
+        (.reactionTTL // 0),
+        (.bubbleWidth // 44),
+        (.bubbleMargin // 8),
+        ((.rainbowColors // []) | map(tostring) | join(" "))
+      ] | map("x" + tostring) | @tsv' "$CONFIG_FILE" 2>/dev/null)
+    IFS=$'\t' read -r _cfg_theme _CFG_TTL _CFG_BW _CFG_BM _custom <<< "$CFG_TSV"
+    _cfg_theme=${_cfg_theme#x}
+    _CFG_TTL=${_CFG_TTL#x}
+    _CFG_BW=${_CFG_BW#x}
+    _CFG_BM=${_CFG_BM#x}
+    _custom=${_custom#x}
     [ "$_cfg_theme" = "light" ] && _THEME="light"
 fi
+
+# ─── Rarity color (theme-aware) ─────────────────────────────────────────────
 
 NC=$'\033[0m'
 case "$RARITY" in
@@ -101,14 +166,11 @@ RAINBOW=(
   $'\033[38;2;180;50;220m'
 )
 
-if [ -f "$CONFIG_FILE" ]; then
-    _custom=$(jq -r '(.rainbowColors // []) | @tsv' "$CONFIG_FILE" 2>/dev/null)
-    if [ -n "$_custom" ]; then
-        RAINBOW=()
-        for _hex in $_custom; do
-            RAINBOW+=("$(_hex_to_ansi "$_hex")")
-        done
-    fi
+if [ -n "$_custom" ]; then
+    RAINBOW=()
+    for _hex in $_custom; do
+        RAINBOW+=("$(_hex_to_ansi "$_hex")")
+    done
 fi
 
 RAINBOW_LEN=${#RAINBOW[@]}
@@ -163,14 +225,10 @@ REACTION_FILE="$BUDDY_STATE_DIR/reaction.$SID.json"
 REACTION_TTL=0
 INNER_W=44
 MARGIN=8
-if [ -f "$CONFIG_FILE" ]; then
-    _ttl=$(jq -r '.reactionTTL // 0' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    case "$_ttl" in ''|*[!0-9]*) ;; *) REACTION_TTL="$_ttl" ;; esac
-    _bw=$(jq -r '.bubbleWidth // 44' "$CONFIG_FILE" 2>/dev/null || echo 44)
-    case "$_bw" in ''|*[!0-9]*) ;; *) INNER_W="$_bw" ;; esac
-    _bm=$(jq -r '.bubbleMargin // 8' "$CONFIG_FILE" 2>/dev/null || echo 8)
-    case "$_bm" in ''|*[!0-9]*) ;; *) MARGIN="$_bm" ;; esac
-fi
+# Values come from the single config jq call near the top of the script.
+case "$_CFG_TTL" in ''|*[!0-9]*) ;; *) REACTION_TTL="$_CFG_TTL" ;; esac
+case "$_CFG_BW" in ''|*[!0-9]*) ;; *) INNER_W="$_CFG_BW" ;; esac
+case "$_CFG_BM" in ''|*[!0-9]*) ;; *) MARGIN="$_CFG_BM" ;; esac
 if [ -n "$REACTION" ] && [ "$REACTION" != "null" ] && [ "$REACTION" != "" ]; then
     FRESH=0
     if [ "$REACTION_TTL" -eq 0 ]; then
@@ -178,7 +236,8 @@ if [ -n "$REACTION" ] && [ "$REACTION" != "null" ] && [ "$REACTION" != "" ]; the
     elif [ -f "$REACTION_FILE" ]; then
         TS=$(jq -r '.timestamp // 0' "$REACTION_FILE" 2>/dev/null || echo 0)
         if [ "$TS" != "0" ]; then
-            NOW=$(date +%s)
+            # Real wall clock on purpose (freshness must ignore BUDDY_FAKE_NOW)
+            printf -v NOW '%(%s)T' -1 2>/dev/null || NOW=$(date +%s)
             AGE=$(( NOW - TS / 1000 ))
             [ "$AGE" -lt "$REACTION_TTL" ] && FRESH=1
         fi
@@ -224,7 +283,7 @@ if [ -z "$BUBBLE" ] && [ -n "$STDIN_DATA" ]; then
             else printf '%dm' "$m"; fi
         }
         if [ -n "$SP" ]; then
-            SP_INT=$(printf '%.0f' "$SP")
+            printf -v SP_INT '%.0f' "$SP"
             if [ -n "$SR" ]; then
                 USAGE_LINES+=("Session ${SP_INT}% ${ARROW}$(_fmt_mins "$SR")")
             else
@@ -232,7 +291,7 @@ if [ -z "$BUBBLE" ] && [ -n "$STDIN_DATA" ]; then
             fi
         fi
         if [ -n "$WP" ]; then
-            WP_INT=$(printf '%.0f' "$WP")
+            printf -v WP_INT '%.0f' "$WP"
             if [ -n "$WR" ]; then
                 USAGE_LINES+=("Week ${WP_INT}% ${ARROW}$(_fmt_mins "$WR")")
             else
@@ -262,7 +321,7 @@ NAME_LEN=${#NAME_WITH_LEVEL}
 ART_CENTER=6
 NAME_PAD=$(( ART_CENTER - NAME_LEN / 2 ))
 [ "$NAME_PAD" -lt 0 ] && NAME_PAD=0
-NAME_LINE="$(printf '%*s%s' "$NAME_PAD" '' "$NAME_WITH_LEVEL")"
+printf -v NAME_LINE '%*s%s' "$NAME_PAD" '' "$NAME_WITH_LEVEL"
 
 DIM=$'\033[2;3m'
 
@@ -298,8 +357,15 @@ fi
 # (U+FE0F) upgrades the previous narrow symbol to 2 cols (e.g. ❤ + VS16).
 # The ambiguous codepoint list comes from emoji-widths.data, generated by
 # scripts/gen-emoji-widths.ts from the Unicode Emoji_Presentation property.
-EMOJI_WIDTHS_DATA="$(dirname "${BASH_SOURCE[0]}")/emoji-widths.data"
-EMOJI_PRES_2600="$(grep -v '^#' "$EMOJI_WIDTHS_DATA" 2>/dev/null | tr -d '\n')"
+EMOJI_WIDTHS_DATA="$_SELF_DIR/emoji-widths.data"
+# Only pay the grep|tr spawn when dwidth() is actually reachable: every
+# dwidth argument derives from BUBBLE_TEXT (usage lines are measured without
+# dwidth — see the box loop), so a pure-ASCII bubble never needs the table.
+EMOJI_PRES_2600=""
+case "$BUBBLE_TEXT" in
+    *[![:ascii:]]*)
+        EMOJI_PRES_2600="$(grep -v '^#' "$EMOJI_WIDTHS_DATA" 2>/dev/null | tr -d '\n')" ;;
+esac
 
 dwidth() {
     printf '%s' "$1" | iconv -f UTF-8 -t UTF-32LE 2>/dev/null | od -An -tu4 | awk -v pres="$EMOJI_PRES_2600" '
@@ -380,15 +446,25 @@ BOX_W=$(( INNER_W + 4 ))
 BUBBLE_LINES=()
 BUBBLE_TYPES=()  # "border" or "text" — determines coloring
 if [ $TEXT_COUNT -gt 0 ]; then
-    # Top border
-    BORDER=$(printf '%*s' "$(( BOX_W - 2 ))" '' | tr ' ' '-')
+    # Top border (in-shell instead of a tr subprocess)
+    printf -v BORDER '%*s' "$(( BOX_W - 2 ))" ''
+    BORDER=${BORDER// /-}
     BUBBLE_LINES+=(".${BORDER}.")
     BUBBLE_TYPES+=("border")
     # Text rows: "| text padded |"
     for tl in "${TEXT_LINES[@]}"; do
-        tpad=$(( INNER_W - $(dwidth "$tl") ))
+        # Same ASCII fast path as the word-wrap loop above. The reset arrow
+        # (always display width 1 — cp 8635 hits char_width's final return)
+        # is swapped for an ASCII placeholder first, so the usage-fallback
+        # lines also skip the dwidth subprocess pipeline.
+        _tl_m=${tl//"$ARROW"/x}
+        case "$_tl_m" in
+            *[![:ascii:]]*) _tl_w=$(dwidth "$tl") ;;
+            *) _tl_w=${#_tl_m} ;;
+        esac
+        tpad=$(( INNER_W - _tl_w ))
         [ "$tpad" -lt 0 ] && tpad=0
-        padding=$(printf '%*s' "$tpad" '')
+        printf -v padding '%*s' "$tpad" ''
         BUBBLE_LINES+=("| ${tl}${padding} |")
         BUBBLE_TYPES+=("text")
     done
@@ -415,17 +491,20 @@ PAD=$(( COLS - TOTAL_W - MARGIN ))
 # whitespace trim, which is why the card was landing left-aligned. Fix: one
 # Braille Blank as a non-whitespace anchor at column 0 (trim stops there),
 # regular single-width spaces for the rest of the pad.
-case "$(uname -s)" in
-    MINGW*|CYGWIN*|MSYS*)
+# $OSTYPE (always set by bash: msys on Git Bash/MSYS2, cygwin on Cygwin)
+# avoids a uname subprocess; uname stays as fallback for exotic shells.
+case "${OSTYPE:-$(uname -s)}" in
+    msys*|cygwin*|MINGW*|CYGWIN*|MSYS*)
         if [ "$PAD" -ge 2 ]; then
-            SPACER="${B}$(printf '%*s' "$(( PAD - 2 ))" '')"
+            printf -v SPACER '%*s' "$(( PAD - 2 ))" ''
+            SPACER="${B}${SPACER}"
         else
-            SPACER=$(printf '%*s' "$PAD" '')
+            printf -v SPACER '%*s' "$PAD" ''
         fi
         ;;
-    *) SPACER=$(printf "${B}%${PAD}s" "") ;;
+    *) printf -v SPACER "${B}%${PAD}s" "" ;;
 esac
-GAP_STR=$(printf '%*s' "$GAP" '')
+printf -v GAP_STR '%*s' "$GAP" ''
 
 # Vertically center bubble box on the art
 BUBBLE_START=0
@@ -451,7 +530,7 @@ for (( i=0; i<MAX_LINES; i++ )); do
     if [ $i -lt $ART_COUNT ]; then
         art_part="${ALL_COLORS[$i]}${ALL_LINES[$i]}${NC}"
     else
-        art_part=$(printf '%*s' "$ART_W" '')
+        printf -v art_part '%*s' "$ART_W" ''
     fi
 
     if [ $BUBBLE_COUNT -gt 0 ]; then
@@ -476,7 +555,7 @@ for (( i=0; i<MAX_LINES; i++ )); do
                 echo "${SPACER}${C}${pipe_l}${NC}${DIM}${inner}${NC}${C}${pipe_r}${NC}${gap}${art_part}"
             fi
         else
-            empty=$(printf '%*s' "$BOX_W" '')
+            printf -v empty '%*s' "$BOX_W" ''
             echo "${SPACER}${empty}   ${art_part}"
         fi
     else
