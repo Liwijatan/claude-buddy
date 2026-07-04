@@ -314,6 +314,8 @@ export interface BuddyConfig {
   bubbleMargin: number;
   useCombinedStatus: boolean;
   rainbowColors?: string[];
+  nameColor?: string;
+  bubbleTextColor?: string;
   theme: "dark" | "light" | "auto";
   moodEnabled: boolean;
   memoryEnabled: boolean;

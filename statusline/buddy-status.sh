@@ -112,20 +112,26 @@ _CFG_TTL=""
 _CFG_BW=""
 _CFG_BM=""
 _custom=""
+_CFG_NAME_COLOR=""
+_CFG_BUBBLE_TEXT_COLOR=""
 if [ -f "$CONFIG_FILE" ]; then
     CFG_TSV=$(jq -r '[
         (.theme // "auto"),
         (.reactionTTL // 0),
         (.bubbleWidth // 44),
         (.bubbleMargin // 8),
-        ((.rainbowColors // []) | map(tostring) | join(" "))
+        ((.rainbowColors // []) | map(tostring) | join(" ")),
+        (.nameColor // ""),
+        (.bubbleTextColor // "")
       ] | map("x" + tostring) | @tsv' "$CONFIG_FILE" 2>/dev/null)
-    IFS=$'\t' read -r _cfg_theme _CFG_TTL _CFG_BW _CFG_BM _custom <<< "$CFG_TSV"
+    IFS=$'\t' read -r _cfg_theme _CFG_TTL _CFG_BW _CFG_BM _custom _CFG_NAME_COLOR _CFG_BUBBLE_TEXT_COLOR <<< "$CFG_TSV"
     _cfg_theme=${_cfg_theme#x}
     _CFG_TTL=${_CFG_TTL#x}
     _CFG_BW=${_CFG_BW#x}
     _CFG_BM=${_CFG_BM#x}
     _custom=${_custom#x}
+    _CFG_NAME_COLOR=${_CFG_NAME_COLOR#x}
+    _CFG_BUBBLE_TEXT_COLOR=${_CFG_BUBBLE_TEXT_COLOR#x}
     [ "$_cfg_theme" = "light" ] && _THEME="light"
 fi
 
@@ -325,6 +331,20 @@ printf -v NAME_LINE '%*s%s' "$NAME_PAD" '' "$NAME_WITH_LEVEL"
 
 DIM=$'\033[2;3m'
 
+# nameColor/bubbleTextColor (hex, from config.json) override the default dim
+# gray — italic is kept either way, dim is dropped so a custom color shows
+# at full brightness instead of washed out.
+if [ -n "$_CFG_NAME_COLOR" ]; then
+    NAME_COLOR=$'\033[3m'"$(_hex_to_ansi "$_CFG_NAME_COLOR")"
+else
+    NAME_COLOR="$DIM"
+fi
+if [ -n "$_CFG_BUBBLE_TEXT_COLOR" ]; then
+    BUBBLE_TEXT_STYLE=$'\033[3m'"$(_hex_to_ansi "$_CFG_BUBBLE_TEXT_COLOR")"
+else
+    BUBBLE_TEXT_STYLE="$DIM"
+fi
+
 ALL_LINES=()
 ALL_COLORS=()
 _arc=0
@@ -337,7 +357,7 @@ for line in "${ART_LINES[@]}"; do
     fi
     _arc=$(( _arc + 1 ))
 done
-ALL_LINES+=("$NAME_LINE"); ALL_COLORS+=("$DIM")
+ALL_LINES+=("$NAME_LINE"); ALL_COLORS+=("$NAME_COLOR")
 
 ART_W=14
 ART_COUNT=${#ALL_LINES[@]}
@@ -552,7 +572,7 @@ for (( i=0; i<MAX_LINES; i++ )); do
                 pipe_l="${bline:0:1}"
                 pipe_r="${bline: -1}"
                 inner="${bline:1:$(( ${#bline} - 2 ))}"
-                echo "${SPACER}${C}${pipe_l}${NC}${DIM}${inner}${NC}${C}${pipe_r}${NC}${gap}${art_part}"
+                echo "${SPACER}${C}${pipe_l}${NC}${BUBBLE_TEXT_STYLE}${inner}${NC}${C}${pipe_r}${NC}${gap}${art_part}"
             fi
         else
             printf -v empty '%*s' "$BOX_W" ''
