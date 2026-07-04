@@ -38,7 +38,7 @@ ACHIEVEMENT=$(jq -r '.achievement // ""' "$STATE" 2>/dev/null)
 LEVEL=$(jq -r '.level // 1' "$STATE" 2>/dev/null)
 MOOD=$(jq -r '.mood // "focused"' "$STATE" 2>/dev/null)
 
-cat > /dev/null  # drain stdin
+STDIN_DATA=$(cat)
 
 # ─── Animation: pick current frame from server-rendered frames ──────────────
 NOW=${BUDDY_FAKE_NOW:-$(date +%s)}
@@ -82,6 +82,7 @@ case "$RARITY" in
 esac
 
 B=$'\xe2\xa0\x80'  # Braille Blank U+2800
+ARROW=$'\xe2\x86\xbb'  # U+21BB clockwise open circle arrow (reset icon)
 
 # ─── Rainbow colors for shiny buddies ────────────────────────────────────────
 # Default ROYGBIV palette; overridden by rainbowColors in config.json
@@ -191,6 +192,56 @@ if [ -n "$REACTION" ] && [ "$REACTION" != "null" ] && [ "$REACTION" != "" ]; the
     fi
 fi
 
+# ─── Usage fallback (session/weekly rate-limit) ─────────────────────────────
+# When there's no reaction or achievement to show, fill the bubble with
+# Claude Code's rate-limit usage instead of leaving it empty. rate_limits
+# comes straight from the statusline JSON on stdin (Pro/Max only, absent
+# before the first API response) — no extra API call needed. Single jq call
+# so an idle bubble doesn't reintroduce the per-tick subprocess cost that was
+# already fixed once for Windows (see claude_buddy_statusline_perf memory).
+USAGE_LINES=()
+if [ -z "$BUBBLE" ] && [ -n "$STDIN_DATA" ]; then
+    USAGE_TSV=$(printf '%s' "$STDIN_DATA" | jq -r --argjson now "$NOW" '
+        (.rate_limits.five_hour // {}) as $fh
+        | (.rate_limits.seven_day // {}) as $sd
+        | [
+            ($fh.used_percentage // ""),
+            (if $fh.resets_at then (($fh.resets_at - $now) / 60 | floor) else "" end),
+            ($sd.used_percentage // ""),
+            (if $sd.resets_at then (($sd.resets_at - $now) / 60 | floor) else "" end)
+          ] | @tsv' 2>/dev/null)
+    if [ -n "$USAGE_TSV" ]; then
+        IFS=$'\t' read -r SP SR WP WR <<< "$USAGE_TSV"
+        _fmt_mins() {
+            local mins=$1
+            [ "$mins" -lt 0 ] 2>/dev/null && mins=0
+            local d=$(( mins / 1440 ))
+            local rem=$(( mins % 1440 ))
+            local h=$(( rem / 60 ))
+            local m=$(( rem % 60 ))
+            if [ "$d" -gt 0 ]; then printf '%dd%02dh' "$d" "$h"
+            elif [ "$h" -gt 0 ]; then printf '%dh%02dm' "$h" "$m"
+            else printf '%dm' "$m"; fi
+        }
+        if [ -n "$SP" ]; then
+            SP_INT=$(printf '%.0f' "$SP")
+            if [ -n "$SR" ]; then
+                USAGE_LINES+=("Session ${SP_INT}% ${ARROW}$(_fmt_mins "$SR")")
+            else
+                USAGE_LINES+=("Session ${SP_INT}%")
+            fi
+        fi
+        if [ -n "$WP" ]; then
+            WP_INT=$(printf '%.0f' "$WP")
+            if [ -n "$WR" ]; then
+                USAGE_LINES+=("Week ${WP_INT}% ${ARROW}$(_fmt_mins "$WR")")
+            else
+                USAGE_LINES+=("Week ${WP_INT}%")
+            fi
+        fi
+    fi
+fi
+
 # ─── Build all art lines ──────────────────────────────────────────────────────
 # ART_LINES comes from the pre-rendered frame (already includes hat + blink).
 # Center the name under the art. Frames are 12 cols wide (see server/art.ts),
@@ -282,7 +333,9 @@ dwidth() {
 
 # ─── Word-wrap bubble text ────────────────────────────────────────────────────
 TEXT_LINES=()
-if [ -n "$BUBBLE_TEXT" ]; then
+if [ ${#USAGE_LINES[@]} -gt 0 ]; then
+    TEXT_LINES=("${USAGE_LINES[@]}")
+elif [ -n "$BUBBLE_TEXT" ]; then
     WORDS=($BUBBLE_TEXT)
     CUR_LINE=""
     CUR_W=0
