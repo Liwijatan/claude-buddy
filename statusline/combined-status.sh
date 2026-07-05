@@ -8,15 +8,33 @@
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 BUDDY_SCRIPT="$SCRIPT_DIR/buddy-status.sh"
 
-if ! command -v python3 >/dev/null 2>&1; then
+# On Windows, `python3` often resolves to the Microsoft Store app-execution-alias
+# stub (a real file, so `command -v` finds it, but running it just prints a
+# store-redirect message and produces no output) even when a real interpreter
+# is installed only as `python`. Probe candidates by actually running them.
+PYTHON_BIN=""
+for _candidate in python3 python; do
+    if command -v "$_candidate" >/dev/null 2>&1 && "$_candidate" -c "" >/dev/null 2>&1; then
+        PYTHON_BIN="$_candidate"
+        break
+    fi
+done
+
+if [ -z "$PYTHON_BIN" ]; then
     exec "$BUDDY_SCRIPT"
 fi
+
+# Force UTF-8 I/O (Python 3.7+). Without this, Python on Windows falls back to
+# the system codepage (e.g. cp1252 on a German locale) for stdin/stdout, which
+# corrupts the BRAILLE (U+2800) anchor byte used below to locate stat lines —
+# the merge silently never matches and stats never appear.
+export PYTHONUTF8=1
 
 # ── Capture stdin from Claude Code ──────────────────────────────────────────
 STDIN_DATA=$(cat)
 
 # ── Parse rate-limit fields ──────────────────────────────────────────────────
-STATS_JSON=$(printf '%s\n' "$STDIN_DATA" | python3 -c "
+STATS_JSON=$(printf '%s\n' "$STDIN_DATA" | "$PYTHON_BIN" -c "
 import json, sys, datetime
 
 def fmt_session_reset(ts):
@@ -60,7 +78,7 @@ BUDDY_OUTPUT=$("$BUDDY_SCRIPT" </dev/null 2>/dev/null)
 [ -z "$BUDDY_OUTPUT" ] && exit 0
 
 # No rate-limit data → pass buddy output through unchanged
-HAS_DATA=$(python3 -c "
+HAS_DATA=$("$PYTHON_BIN" -c "
 import json, sys
 d = json.loads('''$STATS_JSON''' or '{}')
 print(d.get('has_data', False))
@@ -72,7 +90,7 @@ if [ "$HAS_DATA" != "True" ]; then
 fi
 
 # ── Merge stat lines into buddy output ──────────────────────────────────────
-printf '%s\n' "$BUDDY_OUTPUT" | STATS_JSON="$STATS_JSON" python3 -c "
+printf '%s\n' "$BUDDY_OUTPUT" | STATS_JSON="$STATS_JSON" "$PYTHON_BIN" -c "
 import sys, json, os, re
 
 BRAILLE = '\u2800'
@@ -108,7 +126,13 @@ try:
 except Exception:
     stats = {}
 
-lines = sys.stdin.read().splitlines()
+sys.stdin.reconfigure(encoding='utf-8', newline='')  # disable universal-newline translation:
+# a bare stdin.read() rewrites every embedded \r (used mid-row for cursor return) into \n,
+# doubling the row count and shifting every merge target off by one.
+data = sys.stdin.read()
+if data.endswith('\n'):
+    data = data[:-1]
+lines = data.split('\n')  # not splitlines(): would still split on the (now-preserved) \r
 n = len(lines)
 center = 1 
 
