@@ -9,12 +9,17 @@ SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 BUDDY_SCRIPT="$SCRIPT_DIR/buddy-status.sh"
 
 # On Windows, `python3` often resolves to the Microsoft Store app-execution-alias
-# stub (a real file, so `command -v` finds it, but running it just prints a
-# store-redirect message and produces no output) even when a real interpreter
-# is installed only as `python`. Probe candidates by actually running them.
+# stub (a real file under .../WindowsApps/, so `command -v` finds it, but running
+# it just prints a store-redirect message and produces no output). Skip candidates
+# that resolve there without spending a process spawn on them; only exec-probe the
+# rest, since a real interpreter may still be installed only as `python`.
 PYTHON_BIN=""
 for _candidate in python3 python; do
-    if command -v "$_candidate" >/dev/null 2>&1 && "$_candidate" -c "" >/dev/null 2>&1; then
+    _path=$(command -v "$_candidate" 2>/dev/null) || continue
+    case "$_path" in
+        */WindowsApps/*) continue ;;
+    esac
+    if "$_candidate" -c "" >/dev/null 2>&1; then
         PYTHON_BIN="$_candidate"
         break
     fi
@@ -33,9 +38,26 @@ export PYTHONUTF8=1
 # ── Capture stdin from Claude Code ──────────────────────────────────────────
 STDIN_DATA=$(cat)
 
-# ── Parse rate-limit fields ──────────────────────────────────────────────────
-STATS_JSON=$(printf '%s\n' "$STDIN_DATA" | "$PYTHON_BIN" -c "
-import json, sys, datetime
+# ── Capture buddy art (buddy reads state files, not stdin) ───────────────────
+BUDDY_OUTPUT=$("$BUDDY_SCRIPT" </dev/null 2>/dev/null)
+
+# No buddy output → exit silently (muted, no state, etc.)
+[ -z "$BUDDY_OUTPUT" ] && exit 0
+
+# ── Parse rate-limit fields, merge stat lines into buddy output ──────────────
+# One Python process for both steps (was three) — each extra interpreter spawn
+# costs ~100-300ms on Windows and had pushed total runtime past refreshInterval,
+# making Crittner disappear the same way as the jq-call issue in
+# claude_buddy_statusline_perf memory.
+printf '%s\n' "$BUDDY_OUTPUT" | STDIN_DATA="$STDIN_DATA" "$PYTHON_BIN" -c "
+import sys, json, os, datetime
+
+BRAILLE = '⠀'
+GREEN   = '\033[32m'
+YELLOW  = '\033[33m'
+RED     = '\033[31m'
+DIM     = '\033[2m'
+NC      = '\033[0m'
 
 def fmt_session_reset(ts):
     if not ts: return '--'
@@ -54,51 +76,33 @@ def fmt_weekly_reset(ts):
     return f'{d}d{h:02d}h' if d else (f'{h}h{m:02d}m' if h else f'{m}m')
 
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(os.environ.get('STDIN_DATA', '') or '{}')
     rl = data.get('rate_limits', {})
     fh = rl.get('five_hour', {})
     sd = rl.get('seven_day', {})
     sess_pct = fh.get('used_percentage')
     week_pct = sd.get('used_percentage')
-    print(json.dumps({
+    stats = {
         'sess_pct': sess_pct,
         'sess_reset': fmt_session_reset(fh.get('resets_at')),
         'week_pct': week_pct,
         'week_reset': fmt_weekly_reset(sd.get('resets_at')),
         'has_data': sess_pct is not None or week_pct is not None,
-    }))
+    }
 except Exception:
-    print('{}')
-" 2>/dev/null)
+    stats = {'has_data': False}
 
-# ── Capture buddy art (buddy reads state files, not stdin) ───────────────────
-BUDDY_OUTPUT=$("$BUDDY_SCRIPT" </dev/null 2>/dev/null)
+sys.stdin.reconfigure(encoding='utf-8', newline='')  # disable universal-newline translation:
+# a bare stdin.read() rewrites every embedded \r (used mid-row for cursor return) into \n,
+# doubling the row count and shifting every merge target off by one.
+buddy_data = sys.stdin.read()
+if buddy_data.endswith('\n'):
+    buddy_data = buddy_data[:-1]
+lines = buddy_data.split('\n')  # not splitlines(): would still split on the (now-preserved) \r
 
-# No buddy output → exit silently (muted, no state, etc.)
-[ -z "$BUDDY_OUTPUT" ] && exit 0
-
-# No rate-limit data → pass buddy output through unchanged
-HAS_DATA=$("$PYTHON_BIN" -c "
-import json, sys
-d = json.loads('''$STATS_JSON''' or '{}')
-print(d.get('has_data', False))
-" 2>/dev/null)
-
-if [ "$HAS_DATA" != "True" ]; then
-    printf '%s\n' "$BUDDY_OUTPUT"
-    exit 0
-fi
-
-# ── Merge stat lines into buddy output ──────────────────────────────────────
-printf '%s\n' "$BUDDY_OUTPUT" | STATS_JSON="$STATS_JSON" "$PYTHON_BIN" -c "
-import sys, json, os, re
-
-BRAILLE = '\u2800'
-GREEN   = '\033[32m'
-YELLOW  = '\033[33m'
-RED     = '\033[31m'
-DIM     = '\033[2m'
-NC      = '\033[0m'
+if not stats.get('has_data'):
+    print('\n'.join(lines))
+    sys.exit(0)
 
 def color_for(pct):
     if pct is None: return DIM
@@ -117,25 +121,11 @@ def fmt_stat(label, pct, reset):
     c = color_for(pct)
     pct_str = f'{round(pct):3d}%' if pct is not None else '  -%'
     bar = build_bar(pct)
-    text = f'{DIM}{label}{NC} {c}{pct_str}{NC} {bar} {c}↻{reset}{NC}'
-    visual_width = 2 + 1 + 4 + 1 + 10 + 1 + 1 + len(reset)
+    text = f'{DIM}{label}{NC} {c}{pct_str}{NC} {bar} {c}↻ {reset}{NC}'
+    visual_width = 2 + 1 + 4 + 1 + 10 + 1 + 1 + 1 + len(reset)
     return text, visual_width
 
-try:
-    stats = json.loads(os.environ.get('STATS_JSON', '{}'))
-except Exception:
-    stats = {}
-
-sys.stdin.reconfigure(encoding='utf-8', newline='')  # disable universal-newline translation:
-# a bare stdin.read() rewrites every embedded \r (used mid-row for cursor return) into \n,
-# doubling the row count and shifting every merge target off by one.
-data = sys.stdin.read()
-if data.endswith('\n'):
-    data = data[:-1]
-lines = data.split('\n')  # not splitlines(): would still split on the (now-preserved) \r
-n = len(lines)
-center = 1 
-
+center = 1
 stat_items = [
     fmt_stat('5h', stats.get('sess_pct'), stats.get('sess_reset', '--')),
     fmt_stat('7d', stats.get('week_pct'), stats.get('week_reset', '--')),
