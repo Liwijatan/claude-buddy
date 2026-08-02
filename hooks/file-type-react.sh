@@ -28,8 +28,29 @@ fi
 MUTED=$(jq -r '.muted // false' "$STATUS_FILE" 2>/dev/null)
 [ "$MUTED" = "true" ] && exit 0
 
-FILE_PATH=$(echo "$INPUT" | jq -r '.file_path // ""' 2>/dev/null)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""' 2>/dev/null)
 [ -z "$FILE_PATH" ] && exit 0
+
+# Large-diff XP for Edit/Write, mirroring react.sh's git-diffstat-based detection
+# (same >80-line threshold, same "large_diff" event) but sourced from the actual
+# tool_input instead of Bash output text -- Edit/Write never awarded XP before,
+# only Bash commands whose stdout happened to contain a git "N insertions" line.
+# Deliberately placed BEFORE the file-type/random-skip gates below: those exist to
+# throttle the *cute comment* feature, not to gate whether real work counts.
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null)
+DIFF_LINES=0
+case "$TOOL_NAME" in
+    Write)
+        DIFF_LINES=$(echo "$INPUT" | jq -r '(.tool_input.content // "") | split("\n") | length' 2>/dev/null || echo 0)
+        ;;
+    Edit)
+        DIFF_LINES=$(echo "$INPUT" | jq -r '(.tool_input.new_string // "") | split("\n") | length' 2>/dev/null || echo 0)
+        ;;
+esac
+if [ "${DIFF_LINES:-0}" -gt 80 ] 2>/dev/null && [ -x "$(command -v bun)" ]; then
+    PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    bun run "$PLUGIN_ROOT/server/award-xp.ts" "large_diff" >/dev/null 2>&1 &
+fi
 
 FILE_TYPE=""
 case "$FILE_PATH" in
