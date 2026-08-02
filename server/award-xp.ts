@@ -10,7 +10,7 @@
  */
 
 import { awardXp } from "./xp";
-import { loadCompanionSlot, loadActiveSlot } from "./state";
+import { loadCompanionSlot, loadActiveSlot, writeStatusState } from "./state";
 import type { XpEvent } from "./xp";
 
 const VALID_EVENTS = new Set([
@@ -40,6 +40,12 @@ function main(): void {
   const rarity = companion?.bones.rarity;
 
   const state = awardXp(event as XpEvent, slot, species, rarity);
+  // status.json (read by the statusline shell script every tick) is otherwise only
+  // refreshed by explicit MCP tool calls (buddy_pet, summon, mute, ...) — ordinary
+  // hook-driven XP (turn/time_spent/large_diff/...) never touched it, so the
+  // statusline's level/xp display went stale as soon as XP moved past what the last
+  // MCP call had written. Sync it here too.
+  if (companion) writeStatusState(companion);
   console.log(
     `XP awarded: +${event} → Level ${state.level} (${state.totalXp.toLocaleString()} XP total)`,
   );
